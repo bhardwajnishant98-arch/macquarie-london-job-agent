@@ -283,7 +283,7 @@ def main() -> int:
 
             new_matches.append(job)
 
-    if not new_matches:
+   if not new_matches:
     print("No new matching London, UK roles found.")
     send_telegram("✅ Macquarie job agent ran successfully — no new London (UK) matches today.")
     return 0
