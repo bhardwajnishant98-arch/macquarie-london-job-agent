@@ -282,13 +282,12 @@ def main() -> int:
                 continue
 
             new_matches.append(job)
-
+            
     if not new_matches:
-    print("No new matching roles found for London, UK")
-    send_telegram("Macquarie Job agent ran successfully - no new London(UK) Maches Found today.")
+    print("No new matching London, UK roles found.")
+    send_telegram("✅ Macquarie job agent ran successfully — no new London (UK) matches today.")
     return 0
     
-
     # Build Telegram message (with 2–3 bullet summary)
     lines = ["New Macquarie London (UK) roles matching your filters:"]
 
