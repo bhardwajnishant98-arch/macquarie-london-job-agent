@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -11,9 +12,13 @@ BASE = "https://recruitment.macquarie.com/en_US/careers"
 SEARCH_URL = f"{BASE}/SearchJobs"
 STATE_PATH = Path("jobs/seen_jobs.json")
 
+# --- Performance knobs ---
 RECORDS_PER_PAGE = 9
-OFFSETS = list(range(0, 180, 9))  # scan ~20 pages
+OFFSETS = list(range(0, 72, 9))  # ~8 pages (fast). Increase if needed: range(0, 180, 9)
+HTTP_TIMEOUT_SECONDS = 10        # keep it snappy
+MAX_SECONDS = 120               # hard cap to avoid long runs (2 minutes)
 
+# --- Filters ---
 KEYWORDS = [
     "technology risk",
     "operational risk",
@@ -22,14 +27,20 @@ KEYWORDS = [
     "technology business operational risk",
     "tborm",
     "operational resilience",
+    "resilience",
     "controls",
     "governance",
     "first line",
     "1lod",
     "macquarie asset management",
-    "mam",
+    "2LOD",
+    "Cloud Security"
+    "Privacy"
+    "SOX"
+    "Audit"
 ]
 
+# Hard location filter: London + UK variants
 LONDON_UK_PATTERNS = [
     r"\blondon\b.*\b(uk|united kingdom|england)\b",
     r"\b(uk|united kingdom|england)\b.*\blondon\b",
@@ -53,21 +64,26 @@ def keyword_match(text: str) -> bool:
 def load_seen_ids() -> set:
     if not STATE_PATH.exists():
         return set()
-    data = json.loads(STATE_PATH.read_text())
+    data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
     return set(data.get("seen_job_ids", []))
 
 
 def save_seen_ids(seen: set) -> None:
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    STATE_PATH.write_text(json.dumps({"seen_job_ids": sorted(seen)}, indent=2))
+    STATE_PATH.write_text(
+        json.dumps({"seen_job_ids": sorted(seen)}, indent=2),
+        encoding="utf-8",
+    )
 
 
 def http_get(url: str, params: Optional[dict] = None) -> str:
     headers = {
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": "Mozilla/5.0 (compatible; macquarie-job-agent/1.0)",
         "Accept-Language": "en-GB,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     }
-    r = requests.get(url, params=params, headers=headers, timeout=30)
+    r = requests.get(url, params=params, headers=headers, timeout=HTTP_TIMEOUT_SECONDS)
     r.raise_for_status()
     return r.text
 
@@ -81,10 +97,14 @@ def extract_job_links(html: str) -> List[str]:
             if href.startswith("/"):
                 href = "https://recruitment.macquarie.com" + href
             links.append(href)
+    # de-dupe while preserving order
     return list(dict.fromkeys(links))
 
 
 def parse_job_id(url: str) -> Optional[str]:
+    # Patterns:
+    # .../JobDetail?jobId=20258
+    # .../JobDetail/Some-Title/15459
     m = re.search(r"[?&]jobId=(\d+)", url)
     if m:
         return m.group(1)
@@ -94,12 +114,30 @@ def parse_job_id(url: str) -> Optional[str]:
     return None
 
 
+def extract_title(soup: BeautifulSoup) -> str:
+    h = soup.find(["h1", "h2"])
+    return h.get_text(" ", strip=True) if h else "Macquarie role"
+
+
+def extract_location_guess(text: str) -> str:
+    # best-effort: find a London, UK string near “Location”
+    t = re.sub(r"\s+", " ", text)
+    m = re.search(r"(?i)\blocation\b[:\s-]*([^|]{0,80})", t)
+    if m:
+        return m.group(1).strip()
+    # fallback: London + UK snippet
+    m2 = re.search(r"(?i)(London[^.]{0,80}(United Kingdom|UK|England))", t)
+    if m2:
+        return m2.group(1).strip()
+    return "London, UK (inferred)"
+
+
 def extract_summary_bullets(soup: BeautifulSoup, limit: int = 3) -> List[str]:
     bullets = []
     for li in soup.find_all("li"):
-        text = li.get_text(" ", strip=True)
-        if 25 <= len(text) <= 200:
-            bullets.append(text)
+        txt = li.get_text(" ", strip=True)
+        if 25 <= len(txt) <= 220:
+            bullets.append(txt)
         if len(bullets) >= limit:
             break
     return bullets
@@ -109,67 +147,98 @@ def send_telegram(message: str) -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
+        print("Telegram secrets missing; skipping Telegram send.")
         return
 
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "disable_web_page_preview": True,
-    }
-    requests.post(url, json=payload, timeout=20).raise_for_status()
+    api = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": message, "disable_web_page_preview": True}
+    r = requests.post(api, json=payload, timeout=HTTP_TIMEOUT_SECONDS)
+    r.raise_for_status()
 
 
 def main() -> int:
+    start = time.time()
     seen_ids = load_seen_ids()
-    new_messages = []
+    new_alerts = []
+
+    def time_cap_reached() -> bool:
+        return (time.time() - start) > MAX_SECONDS
 
     for offset in OFFSETS:
+        if time_cap_reached():
+            print("Time cap reached; stopping early.")
+            break
+
         params = {
             "jobOffset": offset,
             "jobRecordsPerPage": RECORDS_PER_PAGE,
             "listFilterMode": 1,
         }
-        html = http_get(SEARCH_URL, params=params)
-        links = extract_job_links(html)
+
+        try:
+            search_html = http_get(SEARCH_URL, params=params)
+        except Exception as e:
+            print(f"Search page fetch failed at offset={offset}: {e}")
+            continue
+
+        links = extract_job_links(search_html)
 
         for link in links:
+            if time_cap_reached():
+                print("Time cap reached during link scan; stopping early.")
+                break
+
             job_id = parse_job_id(link)
             if not job_id or job_id in seen_ids:
                 continue
 
-            detail_html = http_get(link)
+            try:
+                detail_html = http_get(link)
+            except Exception as e:
+                print(f"Detail fetch failed for {link}: {e}")
+                continue
+
             soup = BeautifulSoup(detail_html, "lxml")
             page_text = soup.get_text(" ", strip=True)
 
+            # HARD location filter
             if not is_london_uk(page_text):
                 continue
 
+            # Keyword filter
             if not keyword_match(page_text):
                 continue
 
-            bullets = extract_summary_bullets(soup)
-            message = [
-                "📢 New Macquarie London (UK) role found",
+            title = extract_title(soup)
+            location = extract_location_guess(page_text)
+            bullets = extract_summary_bullets(soup, limit=3)
+
+            msg_lines = [
+                "📢 New Macquarie London (UK) role matching your filters",
                 "",
-                link,
+                f"• {title}",
+                f"• Location: {location}",
+                f"• Link: {link}",
             ]
             for b in bullets:
-                message.append(f"• {b}")
+                msg_lines.append(f"  - {b}")
 
-            new_messages.append("\n".join(message))
+            new_alerts.append("\n".join(msg_lines))
             seen_ids.add(job_id)
 
-    if not new_messages:
+    # Persist state even if we stop early
+    save_seen_ids(seen_ids)
+
+    if not new_alerts:
         print("No new matching London, UK roles found.")
+        # Heartbeat: remove this line later if you don’t want a daily ping
         send_telegram("✅ Macquarie job agent ran successfully — no new London (UK) matches today.")
-        save_seen_ids(seen_ids)
         return 0
 
-    for msg in new_messages:
-        send_telegram(msg)
+    for alert in new_alerts:
+        send_telegram(alert)
 
-    save_seen_ids(seen_ids)
+    print(f"Sent {len(new_alerts)} Telegram alert(s).")
     return 0
 
 
